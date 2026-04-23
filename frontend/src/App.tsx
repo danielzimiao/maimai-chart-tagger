@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { UploadZone } from './components/UploadZone'
+import { ResultsPanel } from './components/ResultsPanel'
 import { analyzeChart, type AnalysisResult } from './api'
 
 type AppState = 'idle' | 'analyzing' | 'results'
@@ -11,11 +12,8 @@ function App() {
   const [results, setResults] = useState<AnalysisResult | null>(null)
   const [activeBrowseTag, setActiveBrowseTag] = useState<string | null>(null)
 
-  // Suppress unused variable warnings during development
+  // Suppress unused variable warning during development
   void uploadedFile
-  void results
-  void activeBrowseTag
-  void setActiveBrowseTag
 
   const handleFileSelect = async (file: File) => {
     setUploadedFile(file)
@@ -90,12 +88,12 @@ function App() {
                 </p>
               </div>
             ) : (
-              <div className="flex flex-col items-center gap-4 text-gray-300">
-                <p className="text-2xl font-semibold text-white">Results here</p>
-                <p className="text-sm text-gray-500">
-                  Difficulty, tags, and similar songs will appear here
-                </p>
-              </div>
+              results && (
+                <ResultsPanel
+                  results={results}
+                  onTagClick={(tag) => setActiveBrowseTag(tag)}
+                />
+              )
             )}
           </motion.div>
         </motion.div>
