@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { UploadZone } from './components/UploadZone'
 import { ResultsPanel } from './components/ResultsPanel'
+import { TagBrowsePanel } from './components/TagBrowsePanel'
 import { analyzeChart, type AnalysisResult } from './api'
 
 type AppState = 'idle' | 'analyzing' | 'results'
@@ -96,6 +97,17 @@ function App() {
               )
             )}
           </motion.div>
+
+          {/* Far-right panel — tag browse (animated in/out) */}
+          <AnimatePresence>
+            {activeBrowseTag && (
+              <TagBrowsePanel
+                key={activeBrowseTag}
+                tag={activeBrowseTag}
+                onClose={() => setActiveBrowseTag(null)}
+              />
+            )}
+          </AnimatePresence>
         </motion.div>
       )}
     </AnimatePresence>
