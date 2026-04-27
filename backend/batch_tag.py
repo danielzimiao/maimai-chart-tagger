@@ -48,6 +48,12 @@ def main():
         if not song_dir.is_dir():
             continue
 
+        # Skip 宴会铺面 — folder names start with [kanji]
+        if song_dir.name.startswith('['):
+            print(f"[SKIP] {song_dir.name} — 宴会铺面 ignored")
+            skip_count += 1
+            continue
+
         maidata = next(song_dir.rglob('maidata.txt'), None)
         if maidata is None:
             print(f"[SKIP] {song_dir.name} — no maidata.txt found")

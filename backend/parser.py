@@ -22,9 +22,122 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from maiconverter.simai import parse_file
+from maiconverter.simai import parse_file_str
 from maiconverter.simai.simainote import TapNote, HoldNote, SlideNote, TouchHoldNote
 from maiconverter.event import NoteType
+
+
+def _preprocess_simai(text: str) -> str:
+    """Normalize simai text so maiconverter can parse it.
+
+    Fixes common issues in the wild:
+    - UTF-8 BOM at start of file.
+    - Windows line endings (\r\n) — normalize to \n.
+    - Empty metadata fields (e.g. ``&des=``) — the Lark grammar requires a
+      STRING token after ``=``, so we drop lines whose value is blank.
+    """
+    text = text.lstrip("﻿")  # strip UTF-8 BOM
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^&[a-zA-Z0-9_]+=\s*$", stripped):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+# Slide direction characters in simai fragment notation.
+_SLIDE_CHARS = frozenset("-^<>szvwpqV@")
+
+
+def _fallback_parse(raw_simai: str) -> dict:
+    """Regex-based note counter used when maiconverter cannot parse the file.
+
+    Handles modern simai notation (chained paths, bx/bn modifiers, etc.) that
+    maiconverter 0.14.5 rejects.  Counts are approximate but good enough for
+    the downstream Claude analyzer.
+    """
+    # --- BPM from metadata ---
+    bpm = 0.0
+    m = re.search(r"&bpm\s*=\s*([0-9.]+)", raw_simai)
+    if m:
+        bpm = float(m.group(1))
+
+    # --- Find the highest &inote_N= section ---
+    # Each section runs from &inote_N= up to the next &-tag or end of string.
+    chart_text = ""
+    highest_n = -1
+    for m in re.finditer(r"&inote_(\d+)\s*=\s*(.*?)(?=\n&|\Z)", raw_simai, re.DOTALL):
+        n = int(m.group(1))
+        if n > highest_n:
+            highest_n = n
+            chart_text = m.group(2)
+
+    if not chart_text:
+        return {
+            "total_notes": 0, "tap_count": 0, "hold_count": 0, "slide_count": 0,
+            "bpm": bpm, "duration_seconds": 0.0, "raw_simai": raw_simai,
+        }
+
+    # --- BPM from chart if not in metadata ---
+    if bpm == 0.0:
+        m = re.search(r"\(([0-9.]+)\)", chart_text)
+        if m:
+            bpm = float(m.group(1))
+
+    # --- Strip control tokens and whitespace ---
+    clean = re.sub(r"\([0-9.]+\)", "", chart_text)   # (BPM) markers
+    clean = re.sub(r"\{[0-9.]+\}", "", clean)          # {divisor} markers
+    clean = re.sub(r"\[[^\]]*\]", "", clean)            # [duration] markers
+    clean = re.sub(r"[ \t\r\n]+", "", clean)
+
+    tap_count = 0
+    hold_count = 0
+    slide_count = 0
+
+    _TOUCH_RE = re.compile(r"^[CBAED][0-9]")
+
+    for slot in clean.split(","):
+        slot = slot.strip()
+        if not slot or slot == "E":
+            continue
+        for elem in slot.split("/"):
+            elem = elem.strip()
+            if not elem or elem == "E":
+                continue
+            if _TOUCH_RE.match(elem):
+                if "h" in elem:
+                    hold_count += 1
+                else:
+                    tap_count += 1
+                continue
+            if elem and elem[0] in "12345678":
+                # Strip leading-position modifiers to find slide direction.
+                rest = elem[1:].lstrip("bex$@?!n")
+                if rest and rest[0] in _SLIDE_CHARS:
+                    slide_count += 1
+                elif "h" in elem:
+                    hold_count += 1
+                else:
+                    tap_count += 1
+
+    total_notes = tap_count + hold_count + slide_count
+
+    # Duration: rough estimate from note density at the chart's BPM.
+    duration_seconds = 0.0
+    if bpm > 0 and total_notes > 0:
+        duration_seconds = round(total_notes / bpm * 60.0, 3)
+
+    return {
+        "total_notes": total_notes,
+        "tap_count": tap_count,
+        "hold_count": hold_count,
+        "slide_count": slide_count,
+        "bpm": bpm,
+        "duration_seconds": duration_seconds,
+        "raw_simai": raw_simai,
+    }
 
 
 # NoteType values that count as "tap" for our purposes (includes star/break variants
@@ -89,9 +202,11 @@ def parse(maidata_path: str) -> dict:
         raw_simai = fh.read()
 
     try:
-        _title, charts = parse_file(maidata_path, encoding="utf-8")
-    except Exception as exc:
-        raise ValueError(f"Failed to parse maidata: {exc}") from exc
+        cleaned = _preprocess_simai(raw_simai)
+        _title, charts = parse_file_str(cleaned)
+    except Exception:
+        # maiconverter can't handle modern simai notation — use regex fallback.
+        return _fallback_parse(raw_simai)
 
     # Pick the hardest difficulty chart (highest inote_N number).
     chart = _pick_chart(charts)
