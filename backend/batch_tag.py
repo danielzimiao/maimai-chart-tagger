@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
-import shutil
+import io
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import sys
 from PIL import Image
@@ -25,12 +27,7 @@ def extract_title(maidata_path: Path) -> str:
 
 
 def iter_song_dirs(charts_dir: Path):
-    """Yield every song directory (the folder containing maidata.txt).
-
-    Handles both flat and one-level-nested layouts:
-      flat:   charts_dir/SongName/maidata.txt
-      nested: charts_dir/VersionFolder/SongName/maidata.txt
-    """
+    """Generator — yields one song dir at a time, no bulk list in memory."""
     for entry in sorted(charts_dir.iterdir()):
         if not entry.is_dir():
             continue
@@ -42,15 +39,58 @@ def iter_song_dirs(charts_dir: Path):
                     yield sub
 
 
+def _process_song(song_dir: Path) -> dict:
+    """Worker (runs in subprocess): parse + tag one song, return result dict.
+
+    No DB writes, no file writes — only returns data to the main process.
+    """
+    if song_dir.name.startswith('['):
+        return {'skip': True, 'reason': '宴会铺面'}
+
+    maidata = song_dir / 'maidata.txt'
+    try:
+        features = parse(str(maidata))
+        result = rule_analyze(features)
+        name = extract_title(maidata)
+
+        cover_bytes = None
+        bg_src = next(
+            (song_dir / f for f in ('bg.jpg', 'bg.png', 'BG.jpg', 'BG.png')
+             if (song_dir / f).exists()),
+            None,
+        )
+        if bg_src is not None:
+            try:
+                buf = io.BytesIO()
+                with Image.open(bg_src) as im:
+                    im = im.convert("RGB")
+                    im.thumbnail((256, 256), Image.LANCZOS)
+                    im.save(buf, "JPEG", quality=75, optimize=True)
+                cover_bytes = buf.getvalue()
+            except Exception:
+                cover_bytes = bg_src.read_bytes()
+
+        return {
+            'name': name,
+            'tags': result.get('tags', ['Balanced']),
+            'difficulty': result.get('difficulty'),
+            'cover_bytes': cover_bytes,
+        }
+    except Exception as e:
+        return {'skip': True, 'reason': str(e), 'name': song_dir.name}
+
+
 def main():
     parser_cli = argparse.ArgumentParser(description='Batch-tag maimai charts and populate db.sqlite')
-    parser_cli.add_argument('--charts-dir', required=True, help='Path to folder of chart subdirectories')
-    parser_cli.add_argument('--clear', action='store_true', help='Clear existing songs before ingesting')
+    parser_cli.add_argument('--charts-dir', required=True)
+    parser_cli.add_argument('--clear', action='store_true')
+    parser_cli.add_argument('--workers', type=int, default=os.cpu_count(),
+                            help='Parallel workers (default: cpu count)')
     args = parser_cli.parse_args()
 
     charts_dir = Path(args.charts_dir)
     if not charts_dir.is_dir():
-        print(f"Error: --charts-dir '{charts_dir}' is not a directory.", file=sys.stderr)
+        print(f"Error: '{charts_dir}' is not a directory.", file=sys.stderr)
         sys.exit(1)
 
     covers_dir = Path(__file__).parent / 'static' / 'covers'
@@ -63,55 +103,47 @@ def main():
         conn.close()
         print("Cleared existing songs.")
 
-    song_dirs = list(iter_song_dirs(charts_dir))
     ok_count = 0
     skip_count = 0
 
-    bar = tqdm(song_dirs, unit="song", ncols=80)
-    for song_dir in bar:
-        # Skip 宴会铺面 — folder names start with [kanji]
-        if song_dir.name.startswith('['):
-            skip_count += 1
-            bar.set_postfix(ok=ok_count, skip=skip_count)
-            continue
+    # Count total without loading content (just paths)
+    total = sum(1 for _ in iter_song_dirs(charts_dir))
+    print(f"Found {total} song dirs, using {args.workers} workers.")
 
-        maidata = song_dir / 'maidata.txt'
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(_process_song, d): d for d in iter_song_dirs(charts_dir)}
 
-        try:
-            features = parse(str(maidata))
-            result = rule_analyze(features)
-            tags = result.get('tags', ['Balanced'])
-            difficulty = result.get('difficulty')
-            name = extract_title(maidata)
-
-            bg_image_url = None
-            bg_src = next(
-                (song_dir / f for f in ('bg.jpg', 'bg.png', 'BG.jpg', 'BG.png')
-                 if (song_dir / f).exists()),
-                None,
-            )
-            if bg_src is not None:
-                song_id = f"{ok_count + 1:04d}"
-                dest = covers_dir / f"{song_id}.jpg"
+        with tqdm(as_completed(futures), total=total, unit="song", ncols=90) as bar:
+            for future in bar:
+                song_dir = futures[future]
                 try:
-                    with Image.open(bg_src) as im:
-                        im = im.convert("RGB")
-                        im.thumbnail((256, 256), Image.LANCZOS)
-                        im.save(dest, "JPEG", quality=75, optimize=True)
-                except Exception:
-                    shutil.copy2(bg_src, dest)
-                bg_image_url = f"/static/covers/{song_id}.jpg"
+                    result = future.result()
+                except Exception as e:
+                    tqdm.write(f"[ERR] {song_dir.name} — {e}")
+                    skip_count += 1
+                    bar.set_postfix(ok=ok_count, skip=skip_count)
+                    continue
 
-            insert_song(name, tags, difficulty, None, bg_image_url)
-            ok_count += 1
-            bar.set_postfix(ok=ok_count, skip=skip_count, song=name[:20])
+                if result.get('skip'):
+                    skip_count += 1
+                    bar.set_postfix(ok=ok_count, skip=skip_count)
+                    continue
 
-        except Exception as e:
-            tqdm.write(f"[SKIP] {song_dir.name} — {e}")
-            skip_count += 1
-            bar.set_postfix(ok=ok_count, skip=skip_count)
+                # Write cover (main process only — no concurrency issue)
+                bg_image_url = None
+                if result['cover_bytes']:
+                    song_id = f"{ok_count + 1:04d}"
+                    dest = covers_dir / f"{song_id}.jpg"
+                    dest.write_bytes(result['cover_bytes'])
+                    bg_image_url = f"/static/covers/{song_id}.jpg"
 
-    print(f"\nDone: {ok_count} songs ingested, {skip_count} skipped.")
+                insert_song(result['name'], result['tags'], result['difficulty'],
+                            None, bg_image_url)
+                ok_count += 1
+                bar.set_postfix(ok=ok_count, skip=skip_count,
+                                song=result['name'][:18])
+
+    print(f"\nDone: {ok_count} ingested, {skip_count} skipped.")
 
 
 if __name__ == '__main__':
