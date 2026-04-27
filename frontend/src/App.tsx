@@ -12,19 +12,22 @@ function App() {
   const [uploadedFile, setUploadedFile] = useState<File | null>(null)
   const [results, setResults] = useState<AnalysisResult | null>(null)
   const [activeBrowseTag, setActiveBrowseTag] = useState<string | null>(null)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   // Suppress unused variable warning during development
   void uploadedFile
 
   const handleFileSelect = async (file: File) => {
     setUploadedFile(file)
+    setErrorMsg(null)
     setAppState('analyzing')
     try {
       const result = await analyzeChart(file)
       setResults(result)
       setAppState('results')
     } catch (err) {
-      console.error('Analysis failed:', err)
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      setErrorMsg(msg)
       setAppState('idle')
     }
   }
@@ -48,6 +51,11 @@ function App() {
               Upload a chart to analyze difficulty and find similar songs
             </p>
             <UploadZone onFileSelect={handleFileSelect} />
+            {errorMsg && (
+              <div className="mt-4 w-full max-w-md rounded-lg bg-red-900/60 border border-red-700 px-4 py-3 text-red-200 text-sm">
+                <span className="font-semibold">Error: </span>{errorMsg}
+              </div>
+            )}
           </div>
         </motion.div>
       ) : (
